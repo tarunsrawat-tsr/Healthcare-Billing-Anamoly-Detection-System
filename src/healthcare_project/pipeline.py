@@ -1,7 +1,4 @@
 import duckdb
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import IsolationForest
 
 def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
@@ -22,5 +19,41 @@ def build_pipeline(csv_path: str, min_support: int = 8) -> duckdb.DuckDBPyConnec
     
     con.execute("ALTER TABLE claims ADD COLUMN markup_ratio DOUBLE")
     con.execute("UPDATE claims SET markup_ratio = charges / NULLIF(payments, 0)")
+
+    con.execute(f"""
+        CREATE TABLE scored AS
+        WITH hrr_stats AS (
+            SELECT drg, hrr, COUNT(*) as n, MEDIAN(markup_ratio) as med, 
+                   MEDIAN(ABS(markup_ratio - MEDIAN(markup_ratio) OVER(PARTITION BY drg, hrr))) as mad 
+            FROM claims GROUP BY drg, hrr
+        ),
+        state_stats AS (
+            SELECT drg, state, COUNT(*) as n, MEDIAN(markup_ratio) as med, 
+                   MEDIAN(ABS(markup_ratio - MEDIAN(markup_ratio) OVER(PARTITION BY drg, state))) as mad 
+            FROM claims GROUP BY drg, state
+        ),
+        nat_stats AS (
+            SELECT drg, COUNT(*) as n, MEDIAN(markup_ratio) as med, 
+                   MEDIAN(ABS(markup_ratio - MEDIAN(markup_ratio) OVER(PARTITION BY drg))) as mad 
+            FROM claims GROUP BY drg
+        )
+        SELECT c.*,
+            COALESCE(
+                CASE WHEN h.n >= {min_support} THEN h.med END,
+                CASE WHEN s.n >= {min_support} THEN s.med END, n.med) AS peer_median,
+            COALESCE(
+                CASE WHEN h.n >= {min_support} THEN h.mad END,
+                CASE WHEN s.n >= {min_support} THEN s.mad END, n.mad) AS peer_mad
+        FROM claims c
+        LEFT JOIN hrr_stats h ON c.drg = h.drg AND c.hrr = h.hrr
+        LEFT JOIN state_stats s ON c.drg = s.drg AND c.state = s.state
+        LEFT JOIN nat_stats n ON c.drg = n.drg
+    """)
+
+    con.execute("""
+        ALTER TABLE scored ADD COLUMN robust_z DOUBLE;
+        UPDATE scored SET robust_z = 
+            CASE WHEN peer_mad > 0 THEN (markup_ratio - peer_median) / (1.4826 * peer_mad) ELSE 0 END;
+    """)
     
     return con
